@@ -24,22 +24,53 @@ import win32process
 from PIL import Image, ImageDraw
 import pystray
 
-# ===============================
-# 多重起動防止
-# ===============================
-def check_already_running():
-    current_name = os.path.basename(sys.argv[0])
-    current_pid = os.getpid()
-    for proc in psutil.process_iter(['pid', 'cmdline']):
-        try:
-            if proc.info['pid'] != current_pid and proc.info['cmdline']:
-                if current_name in " ".join(proc.info['cmdline']):
-                    print("既に起動中です。多重起動を防止します。")
-                    sys.exit(0)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+# ★ミューテックス（多重起動防止）のためにインポートを追加
+import win32event
+import win32api
+import pywintypes
+import winerror  # ★修正点 1: winerror をインポート
 
-check_already_running()
+# ===============================
+# 多重起動防止 (Mutex版)
+# ===============================
+# ★ハンドルをグローバルに保持し、プログラム終了まで解放を防ぐ
+global_mutex_handle = None
+
+
+def check_already_running_mutex():
+    global global_mutex_handle
+
+    # 他のアプリと重複しないユニークな文字列（UUIDやハッシュが望ましい）
+    mutex_name = "Global\\TimeTrackerLogger_v2_Mutex_029768a39e308d68"
+
+    try:
+        # ミューテックス（システムワイドなロック）を作成
+        global_mutex_handle = win32event.CreateMutex(None, 1, mutex_name)
+
+        # エラーコードをチェック
+        last_error = win32api.GetLastError()
+
+        # ★修正点 2: pywintypes -> winerror に変更
+        # 既に同じ名前のミューテックスが存在した場合
+        if last_error == winerror.ERROR_ALREADY_EXISTS:
+            print("既に起動中です。多重起動を防止します。")
+
+            # 保持してしまったハンドルを閉じる
+            if global_mutex_handle:
+                win32api.CloseHandle(global_mutex_handle)
+
+            sys.exit(0)
+
+        # print("多重起動チェックOK。ロガーを起動します。") # 正常起動時はCUI非表示なのでコメントアウト
+
+    except Exception as e:
+        print(f"多重起動チェック中にエラーが発生しました: {e}")
+        # エラー時も起動を中止する
+        sys.exit(1)
+
+
+# ★元の check_already_running() の代わりにミューテックス版を呼び出す
+check_already_running_mutex()
 
 # ===============================
 # 定数・設定
@@ -49,6 +80,7 @@ DEFAULT_INTERVAL = 3
 MAX_REPEAT_SEC = 300  # 同一ウィンドウ再記録の最長間隔
 stop_flag = False
 SESSION_ID = str(uuid.uuid4())[:8]
+
 
 # ===============================
 # 設定ロード・保存
@@ -62,13 +94,16 @@ def load_settings():
             pass
     return {"interval": DEFAULT_INTERVAL}
 
+
 def save_settings(settings):
     with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
 
+
 settings = load_settings()
 interval_value = settings.get("interval", DEFAULT_INTERVAL)
 interval_lock = threading.Lock()
+
 
 # ===============================
 # ユーティリティ
@@ -86,6 +121,7 @@ def get_active_window_info():
         pass
     return None, None
 
+
 def safe_open_log():
     for _ in range(3):
         try:
@@ -94,13 +130,16 @@ def safe_open_log():
             time.sleep(1)
     raise PermissionError("ログファイルにアクセスできませんでした。")
 
+
 def current_log_path():
     now = time.localtime()
-    base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(
+        os.path.abspath(__file__))
     log_dir = os.path.join(base_dir, "Logs")
     os.makedirs(log_dir, exist_ok=True)
     hour_block = (now.tm_hour // 6) * 6
     return os.path.join(log_dir, f"activity_{time.strftime('%Y-%m-%d')}_{hour_block:02d}h.csv")
+
 
 # ===============================
 # ロガースレッド
@@ -148,6 +187,7 @@ def logger_thread():
     if current_file:
         current_file.close()
 
+
 # ===============================
 # トレイメニュー構成
 # ===============================
@@ -157,6 +197,7 @@ def create_icon():
     d.ellipse((8, 8, 56, 56), fill=(255, 255, 255))
     return img
 
+
 def set_interval(value):
     global interval_value
     with interval_lock:
@@ -165,6 +206,7 @@ def set_interval(value):
         save_settings(settings)
     print(f"[INFO] 記録間隔を {value} 秒に変更しました。")
 
+
 def build_menu():
     def interval_item(sec):
         return pystray.MenuItem(
@@ -172,15 +214,25 @@ def build_menu():
         )
 
     return pystray.Menu(
-        pystray.MenuItem("Open Log Folder", lambda: os.startfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "Logs"))),
-        pystray.MenuItem("Record Interval", pystray.Menu(interval_item(1), interval_item(3), interval_item(5), interval_item(10))),
+        pystray.MenuItem("Open Log Folder",
+                         lambda: os.startfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "Logs"))),
+        pystray.MenuItem("Record Interval",
+                         pystray.Menu(interval_item(1), interval_item(3), interval_item(5), interval_item(10))),
         pystray.MenuItem("Exit", on_exit)
     )
 
+
 def on_exit(icon, item):
-    global stop_flag
+    global stop_flag, global_mutex_handle
     stop_flag = True
+
+    # ★追加：終了時にミューテックスハンドルを明示的に解放
+    if global_mutex_handle:
+        win32api.CloseHandle(global_mutex_handle)
+        global_mutex_handle = None
+
     icon.stop()
+
 
 def main():
     t = threading.Thread(target=logger_thread, daemon=True)
@@ -193,6 +245,13 @@ def main():
         menu=build_menu(),
     )
     icon.run()
+
+    # ★追加：icon.run() が終了した（＝アプリ終了時）にハンドルを解放
+    global global_mutex_handle
+    if global_mutex_handle:
+        win32api.CloseHandle(global_mutex_handle)
+        global_mutex_handle = None
+
 
 if __name__ == "__main__":
     main()
